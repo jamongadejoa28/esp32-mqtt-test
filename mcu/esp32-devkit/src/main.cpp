@@ -1,7 +1,10 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
-#include <AccelStepper.h>
+#include "driver/mcpwm.h" // ESP32 전용 MCPWM 모듈 사용
+
+// 서보 모터 제어를 LEDC가 아닌 MCPWM 모듈로 완전히 분리하여
+// DC 모터의 LEDC 타이머와 발생하는 하드웨어 충돌(글리치) 원천 차단
 
 // .env 파일에서 빌드 시 자동 주입됩니다 (env_script.py)
 #ifndef WIFI_SSID
@@ -18,37 +21,74 @@ const int MQTT_PORT = 1883;
 const char* MQTT_TOPIC_PUB_SENSOR = "device/sensor";
 const char* MQTT_TOPIC_SUB_CONTROL = "device/control";
 
+// ========================
 // 핀 설정
-#define SENSOR_PIN 13
-#define IN1 26
-#define IN2 25
-#define IN3 33
-#define IN4 32
+// ========================
+#define SENSOR_PIN 34    // (왼쪽 입력 전용 핀 구역으로 이동)
+#define SERVO_1_PIN 32   // 서보 1 (보드 왼쪽 구역으로 이동)
+#define SERVO_2_PIN 33   // 서보 2 (보드 왼쪽 구역으로 이동)
 
-// DC모터 핀 설정 (L298N 등)
-#define DC_EN_PIN 27 // PWM 제어 핀 (IN1 혹은 EN)
-#define DC_DIR_PIN 12 // 방향 제어 핀 (IN2 혹은 DIR)
+// DC모터 핀 설정 (A4950)
+// Slow Decay 제어: IN1=HIGH 고정, IN2에 PWM
+#define DC_IN1_PIN 27  // A4950 IN1 (HIGH 고정)
+#define DC_IN2_PIN 12  // A4950 IN2 (PWM 속도 제어)
 
-AccelStepper stepper(AccelStepper::HALF4WIRE, IN1, IN3, IN2, IN4);
+// ========================
+// LEDC 채널 (DC 모터 전용)
+// ========================
+const int DC_CHANNEL      = 0;
+const int DC_FREQ          = 5000;
+const int DC_RESOLUTION    = 8;     // 0~255
+
+// 서보 제어는 MCPWM을 사용하므로 채널/타이머 할당 불필요
+const int SERVO_RESOLUTION = 16;    // 0~65535 (정밀 제어)
+const int SERVO_MIN_US     = 544;   // 0도 펄스폭 (µs)
+const int SERVO_MAX_US     = 2400;  // 180도 펄스폭 (µs)
+
+// 서보 설정
+const int SERVO_CENTER = 90;   // 중립 위치 (도)
+const int SERVO_OFFSET = 60;   // 중심에서 좌우 이동 각도
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
 // 모터 상태 제어
-enum MotorState { IDLE, MOVING_FORWARD, MOVING_REVERSE, WAITING, MOVING_BACKWARD, SORT_DONE_WAITING };
+enum MotorState { IDLE, WAITING_AT_POSITION, WAITING_AT_ORIGIN };
 MotorState motorState = IDLE;
 unsigned long waitStartTime = 0;
-const int STEPS_60_DEG = 1200; // 4096 기준 약 100도 가량 열리도록 범위 확대
 
 // 센서 처리용
 unsigned long lastSensorDetectTime = 0;
-const unsigned long SENSOR_TIMEOUT = 1000; // 1초 이내 중복 감지 방지 (시뮬레이션용)
+const unsigned long SENSOR_TIMEOUT = 1000;
 
-// DC PWM 설정
-const int pwmChannel = 0;
-const int pwmFreq = 5000;
-const int pwmResolution = 8;
+// ========================
+// 서보 헬퍼 함수 (MCPWM 통신)
+// ========================
+void servo1Write(int angle) {
+  if (angle < 0) angle = 0;
+  if (angle > 180) angle = 180;
+  uint32_t pulseUs = SERVO_MIN_US + (uint32_t)(SERVO_MAX_US - SERVO_MIN_US) * angle / 180;
+  // MCPWM 모듈의 A채널(서보1)로 펄스폭 전송
+  mcpwm_set_duty_in_us(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, pulseUs);
+}
 
+void servo2Write(int angle) {
+  if (angle < 0) angle = 0;
+  if (angle > 180) angle = 180;
+  uint32_t pulseUs = SERVO_MIN_US + (uint32_t)(SERVO_MAX_US - SERVO_MIN_US) * angle / 180;
+  // MCPWM 모듈의 B채널(서보2)로 펄스폭 전송
+  mcpwm_set_duty_in_us(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_B, pulseUs);
+}
+
+void servoStopAll() {
+  // 펄스폭을 0으로 만들어 두 서보 위치 유지(보정) 끄고 잔떨림 방지
+  mcpwm_set_duty_in_us(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A, 0);
+  mcpwm_set_duty_in_us(MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_B, 0);
+}
+
+// ========================
+// MQTT 콜백
+// ========================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String message;
   for (int i = 0; i < length; i++) {
@@ -58,35 +98,48 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   if (String(topic) == MQTT_TOPIC_SUB_CONTROL) {
     if (message == "MOVE_RIGHT" && motorState == IDLE) {
-      Serial.println("[ACTION] Stepper Motor Forward (Right)");
-      stepper.setCurrentPosition(0);
-      stepper.moveTo(STEPS_60_DEG);
-      motorState = MOVING_FORWARD;
+      Serial.println("[ACTION] Servo Motor Right");
+      servo1Write(SERVO_CENTER + SERVO_OFFSET); // 서보 1, 2 모두 움직인다고 가정 (필요시 방향 조절)
+      servo2Write(SERVO_CENTER + SERVO_OFFSET);
+      motorState = WAITING_AT_POSITION;
+      waitStartTime = millis();
     } else if (message == "MOVE_LEFT" && motorState == IDLE) {
-      Serial.println("[ACTION] Stepper Motor Reverse (Left)");
-      stepper.setCurrentPosition(0);
-      stepper.moveTo(-STEPS_60_DEG);
-      motorState = MOVING_REVERSE;
-    } else if (message == "MOVE" && motorState == IDLE) { // 기본 호환성 (우측 이동 유지)
-      stepper.setCurrentPosition(0);
-      stepper.moveTo(STEPS_60_DEG);
-      motorState = MOVING_FORWARD;
+      Serial.println("[ACTION] Servo Motor Left");
+      servo1Write(SERVO_CENTER - SERVO_OFFSET);
+      servo2Write(SERVO_CENTER - SERVO_OFFSET);
+      motorState = WAITING_AT_POSITION;
+      waitStartTime = millis();
+    } else if (message == "MOVE" && motorState == IDLE) {
+      servo1Write(SERVO_CENTER + SERVO_OFFSET);
+      servo2Write(SERVO_CENTER + SERVO_OFFSET);
+      motorState = WAITING_AT_POSITION;
+      waitStartTime = millis();
     } else if (message.startsWith("DC_START:")) {
       int speed = message.substring(9).toInt();
       if (speed < 0) speed = 0;
       if (speed > 255) speed = 255;
-      
-      digitalWrite(DC_DIR_PIN, LOW);
-      ledcWrite(pwmChannel, speed);
+
+      // A4950 Slow Decay: IN1=HIGH(고정), IN2=PWM
+      // PWM LOW → Forward, PWM HIGH → Brake
+      ledcWrite(DC_CHANNEL, 255 - speed);
       Serial.printf("[ACTION] DC Motor Started at speed %d\n", speed);
     } else if (message == "DC_STOP") {
-      ledcWrite(pwmChannel, 0);
+      ledcWrite(DC_CHANNEL, 255);  // (1,1) Brake
       Serial.println("[ACTION] DC Motor Stopped");
     } else if (message == "SENSOR_SIMULATE") {
-      if (millis() - lastSensorDetectTime > SENSOR_TIMEOUT) {
+      if (motorState != IDLE) {
+        Serial.println("[BLOCKED] Sensor ignored: servo in motion");
+      } else if (millis() - lastSensorDetectTime > SENSOR_TIMEOUT) {
         Serial.println("[EVENT] Object Detected by Sensor (Simulated)!");
         mqttClient.publish(MQTT_TOPIC_PUB_SENSOR, "DETECTED");
         lastSensorDetectTime = millis();
+
+        // 서보 모터 열림 동작 시작
+        servo1Write(SERVO_CENTER + SERVO_OFFSET);
+        servo2Write(SERVO_CENTER + SERVO_OFFSET);
+        motorState = WAITING_AT_POSITION;
+        waitStartTime = millis();
+        Serial.println("[ACTION] Servo opening (sensor triggered)");
       }
     }
   }
@@ -111,17 +164,32 @@ void reconnectMQTT() {
 void setup() {
   Serial.begin(115200);
 
-  // DC 모터 설정
-  pinMode(DC_DIR_PIN, OUTPUT);
-  digitalWrite(DC_DIR_PIN, LOW);
-  
-  // 구버전 ESP32 Arduino Core 호환 PWM (현재 PIO 기본값)
-  ledcSetup(pwmChannel, pwmFreq, pwmResolution);
-  ledcAttachPin(DC_EN_PIN, pwmChannel);
-  ledcWrite(pwmChannel, 0);
+  // ★ 부팅 직후: IN1, IN2 모두 HIGH → (1,1) Brake 강제
+  pinMode(DC_IN1_PIN, OUTPUT);
+  pinMode(DC_IN2_PIN, OUTPUT);
+  digitalWrite(DC_IN1_PIN, HIGH);
+  digitalWrite(DC_IN2_PIN, HIGH);
 
-  stepper.setMaxSpeed(4000.0);
-  stepper.setAcceleration(2500.0);
+  // DC 모터: LEDC 채널 0 (타이머 내부 자동할당), 5000Hz, 8bit
+  ledcSetup(DC_CHANNEL, DC_FREQ, DC_RESOLUTION);
+  ledcAttachPin(DC_IN2_PIN, DC_CHANNEL);
+  ledcWrite(DC_CHANNEL, 255);  // Brake
+
+  // ★ 서보 2개: 완전히 독립된 MCPWM 모듈 사용 (채널 A, B)
+  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0A, SERVO_1_PIN);
+  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0B, SERVO_2_PIN);
+  
+  mcpwm_config_t pwm_config;
+  pwm_config.frequency = 50;    // 서보 표준 50Hz
+  pwm_config.cmpr_a = 0;        // 시작 시 duty 0 (정지)
+  pwm_config.cmpr_b = 0;
+  pwm_config.counter_mode = MCPWM_UP_COUNTER;
+  pwm_config.duty_mode = MCPWM_DUTY_MODE_0;
+  mcpwm_init(MCPWM_UNIT_0, MCPWM_TIMER_0, &pwm_config);
+
+  // 두 모터 모두 중립 위치로 시작 초기화
+  servo1Write(SERVO_CENTER);  
+  servo2Write(SERVO_CENTER);
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED) {
@@ -145,26 +213,23 @@ void loop() {
     mqttClient.loop();
   }
 
-  // ==== 1. 스텝모터 비동기 제어 및 DC 자동 정지 시나리오 ====
-  stepper.run();
-  
-  if ((motorState == MOVING_FORWARD || motorState == MOVING_REVERSE) && stepper.distanceToGo() == 0) {
-    motorState = WAITING;
+  // ==== 서보 모터 시나리오 ====
+  if (motorState == WAITING_AT_POSITION && (millis() - waitStartTime >= 2000)) {
+    // 2초 후 서보 중립 복귀
+    servo1Write(SERVO_CENTER);
+    servo2Write(SERVO_CENTER);
+    motorState = WAITING_AT_ORIGIN;
     waitStartTime = millis();
-    Serial.println("[ACTION] Waiting 2 seconds before returning...");
-  } else if (motorState == WAITING && (millis() - waitStartTime >= 2000)) {
-    stepper.moveTo(0); // 원위치 복귀
-    motorState = MOVING_BACKWARD;
-    Serial.println("[ACTION] Stepper Motor Backward origin");
-  } else if (motorState == MOVING_BACKWARD && stepper.distanceToGo() == 0) {
-    motorState = SORT_DONE_WAITING;
-    waitStartTime = millis(); // 1초 대기 시작
-    Serial.println("[ACTION] Stepper Motor Idle, waiting 1 sec to stop DC...");
-  } else if (motorState == SORT_DONE_WAITING && (millis() - waitStartTime >= 1000)) {
+    Serial.println("[ACTION] Servo returning to center");
+  } else if (motorState == WAITING_AT_ORIGIN && (millis() - waitStartTime >= 1000)) {
+    // 서보 PWM 신호 중단 → 잔떨림 방지
+    servoStopAll();
     motorState = IDLE;
-    // 1초 후 DC 모터 정지 및 GUI로 상태 전송
-    ledcWrite(pwmChannel, 0);
-    mqttClient.publish(MQTT_TOPIC_PUB_SENSOR, "DC_STOPPED");
-    Serial.println("[ACTION] Scenario Complete: DC Motor Auto-Stopped");
+    Serial.println("[ACTION] Servo sequence complete");
+
+    // [QR 자동정지 시나리오 - 임시 주석]
+    // ledcWrite(DC_CHANNEL, 255);
+    // mqttClient.publish(MQTT_TOPIC_PUB_SENSOR, "DC_STOPPED");
+    // Serial.println("[ACTION] Scenario Complete: DC Motor Auto-Stopped");
   }
 }
